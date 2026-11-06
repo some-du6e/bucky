@@ -1,0 +1,73 @@
+# Fork-only smoke test (S3Mock stands in for S3) for the bucky PRs. Never part of a PR.
+name: smoke
+on:
+  push:
+    branches: ["ci/**"]
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      S3_REGION: us-east-1
+      AWS_ID: test
+      AWS_SECRET: test
+      AWS_BUCKET: bucky
+      S3_ENDPOINT: http://127.0.0.1:9090
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - name: S3Mock as a stand-in for S3
+        run: |
+          docker run -d --name s3 -p 9090:9090 -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=bucky adobe/s3mock
+          for i in $(seq 60); do curl -sf http://127.0.0.1:9090/bucky >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:9090/bucky >/dev/null
+      - name: Point the session at MinIO (test build only)
+        run: |
+          sed -i 's|Region:      aws.String(os.Getenv("S3_REGION")),|&\n\t\tEndpoint: aws.String(os.Getenv("S3_ENDPOINT")), S3ForcePathStyle: aws.Bool(true),|' *.go
+          grep -n S3_ENDPOINT *.go
+      - run: go vet ./...
+      - run: go build -o bucky .
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3000 ./bucky & PORT=3001 AWS_BUCKET=missing ./bucky & sleep 2
+          B=http://127.0.0.1:3000
+          ok() { echo "ok - $1"; }
+          code() { curl -s -m 60 -o /tmp/body -w '%{http_code}' "$@"; }
+
+          c=$(curl -s -o /dev/null -D /tmp/h -w '%{http_code}' -X OPTIONS -H 'Origin: https://x.test' -H 'Access-Control-Request-Method: POST' $B/)
+          [ "$c" = 204 ] && grep -qi '^access-control-allow-origin: \*' /tmp/h && ok "preflight 204 with CORS"
+          [ "$(code $B/)" = 400 ] && ok "GET is 400"
+          [ "$(code -X POST -F nope=1 $B/)" = 422 ] && ok "missing file is 422 (was 200)"
+          [ "$(code -F file=@go.mod http://127.0.0.1:3001/)" = 500 ] && ok "S3 failure is 500 (was 200)"
+
+          printf 'hello bucky\n' > 'has space.txt'
+          [ "$(code -D /tmp/h -F 'file=@has space.txt' $B/)" = 200 ]
+          url=$(cat /tmp/body); echo "url: $url"
+          grep -qi '^access-control-allow-origin: \*' /tmp/h && ok "upload reply has CORS"
+          case "$url" in *'%!'*) echo "mangled URL"; exit 1;; *%20*) ok "space kept as %20";; *) echo "unexpected URL"; exit 1;; esac
+          [ "$(curl -sf "$url")" = "hello bucky" ] && ok "URL serves the file"
+
+          if [ -f chunked.go ]; then
+            head -c 12582912 /dev/urandom > big.bin   # 12 MB -> parts of 5, 5, 2 MB
+            split -b 5242880 -d -a 1 big.bin part.
+            [ "$(code -X POST "$B/chunked/start?filename=big%20file.bin")" = 200 ]
+            key=$(jq -r .key /tmp/body); id=$(jq -r .uploadId /tmp/body); echo "key: $key"
+            qs="key=$(jq -rn --arg k "$key" '$k|@uri')&uploadId=$(jq -rn --arg k "$id" '$k|@uri')"
+            pids=(); for i in 0 1 2; do curl -sf -m 60 -X PUT --data-binary @part.$i "$B/chunked/part?$qs&n=$((i+1))" > resp.$i & pids+=($!); done; for p in "${pids[@]}"; do wait $p; done
+            parts=$(jq -s 'reverse' resp.0 resp.1 resp.2); echo "$parts"
+            [ "$(code -X POST -H 'Content-Type: application/json' --data "$parts" "$B/chunked/finish?$qs")" = 200 ]
+            url=$(cat /tmp/body); echo "url: $url"
+            [ "$(curl -sf "$url" | sha256sum)" = "$(sha256sum < big.bin)" ] && ok "parallel chunks reassemble byte-for-byte"
+            [ "$(code -X PUT --data x "$B/chunked/part?key=../etc&uploadId=x&n=1")" = 422 ] && ok "bad key is 422"
+            [ "$(code -X PUT --data x "$B/chunked/part?$qs&n=0")" = 422 ] && ok "bad part number is 422"
+            [ "$(code -X POST "$B/chunked/start")" = 422 ] && ok "missing filename is 422"
+            code -X POST "$B/chunked/start?filename=x.bin" >/dev/null
+            k2=$(jq -r .key /tmp/body | jq -Rr @uri); i2=$(jq -r .uploadId /tmp/body | jq -Rr @uri)
+            [ "$(code -X POST "$B/chunked/abort?key=$k2&uploadId=$i2")" = 204 ] && ok "abort is 204"
+            c=$(curl -s -o /dev/null -D /tmp/h -w '%{http_code}' -X OPTIONS $B/chunked/part)
+            [ "$c" = 204 ] && grep -qi '^access-control-allow-methods:.*PUT' /tmp/h && ok "chunked preflight allows PUT"
+          fi
+          echo "all good"
